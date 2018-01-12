@@ -45,3 +45,6 @@ $RECYCLE.BIN/
 Network Trash Folder
 Temporary Items
 .apdisk
+doll_data_out/**/*
+chem_data_out/**/*
+lib/__pycache__/**/*
