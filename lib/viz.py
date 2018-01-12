@@ -56,3 +56,14 @@ def visualize_grid_map(values, x, y, outpath=None, line=None):
     plt.show()
   else:
     plt.savefig(outpath)
+
+def plot_scatter(x, y, percentile=100, outpath=None):
+  x = x[y < np.percentile(y, percentile)]
+  y = y[y < np.percentile(y, percentile)]
+  fig = plt.figure()
+  axes = fig.add_subplot(111)
+  axes.plot(x, y, '.')
+  if outpath is None:
+    plt.show()
+  else:
+    plt.savefig(outpath)
