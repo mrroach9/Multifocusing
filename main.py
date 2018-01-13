@@ -10,7 +10,6 @@ import pyexifinfo as pei
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.lines as lines
-import skimage.morphology as skmorph
 from lib import model, utils, viz
 
 # [Aligning Phase] Maximum acceptable distance when calculating matches of 
@@ -21,18 +20,19 @@ MAXIMUM_ACCEPTABLE_HAMMING_DISTANCE = 20
 VAR_EST_WINDOW_SIZE = 15
 # [Depth Map Phase] Stdandard deviations of Gaussian blurring kernels when
 # estimating blurry-ness of pixels in an image.
-BLURRY_STACK_SIGMAS = np.arange(-20, 21)
 BLURRY_STACK_RADII = np.arange(-20, 21)
 # [Depth Map Phase] Window size to calculate difference between blurred
 # refocused image and original image.
-BLUR_EST_WINDOW_SIZE = 5 #25
+# BLUR_EST_WINDOW_SIZE = 5  # Chem
+BLUR_EST_WINDOW_SIZE = 25 # Camera
 # [Depth Map Phase] Relationship between blurry-ness and working distance can
 # be estimated by a linear formula b = a * (WD - c). where a is only related to
 # device intrinsic params and c is related to distance of a point. When
 # estimating a across pixels, we only pick those with high confidence.
 DEPTH_SLOPE_EST_CONFIDENCE = 90
 DEPTH_SAMPLING_RATIO = 0.01
-VERY_FAR = 0.7
+# VERY_FAR = 3700 # Chem
+VERY_FAR = 0.7  # Camera
 # [Smoothing Phase] When smoothing the image, we first need to remove 
 # extreme outliers. In percenage. 0.8 means remove the highest 0.8% and the 
 # lowest 0.8%.
@@ -44,8 +44,9 @@ DEPTH_SMOOTH_INPAINT_SIZE = 15 # 10
 DEPTH_SMOOTH_GAUSSIAN_BLUR_SIGMA = 4.0 # 3.0
 EXPO_CONST = 5.0
 
-CHEM_DATA_WD = [0.3620, 0.3630, 0.3633726, 0.3640, 0.3650, 0.3660, 0.3670]
-PIXEL_SIZE = 0.0001 #0.055
+CHEM_DATA_WD = [3620, 3630, 3633.726, 3640, 3650, 3660, 3670]
+# PIXEL_SIZE = 0.055  # Chem 
+PIXEL_SIZE = 0.0001 # Camera
 
 def read_and_preprocess(filename, resize_factor=1.0, grayscale=True):
   img = cv2.imread(filename, \
@@ -64,9 +65,11 @@ def read_camera_images(blurry_path, benchmark_path, resize_factor=1.0):
   print('Reading and pre-processing images...')
 
   img_filenames = os.listdir(blurry_path)
-  imgs = [read_and_preprocess(blurry_path + filename, resize_factor) \
+  imgs = [read_and_preprocess(blurry_path + filename, \
+      resize_factor, grayscale=False) \
       for filename in img_filenames]
-  benchmark_img = read_and_preprocess(benchmark_path, resize_factor) \
+  benchmark_img = read_and_preprocess(benchmark_path, \
+      resize_factor, grayscale=False) \
       if benchmark_path is not None else None
 
   exifs = [pei.get_json(blurry_path + filename)[0] \
@@ -87,37 +90,6 @@ def calc_max_incribed_square(trans, shape):
   leftedge = math.ceil(np.max(np.array(topleft + bottomleft)[:, 0]))
   rightedge = math.floor(np.min(np.array(topright + bottomright)[:, 0]))
   return np.array([[topedge, bottomedge], [leftedge, rightedge]], np.uint32)
-
-def variance_box_filter(img, boxsize):
-  if img.ndim == 3:
-    img = np.array(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), np.float32)
-  else:
-    img = np.array(img, np.float32)
-  kernel = (boxsize, boxsize)
-  EX_2 = np.square(cv2.boxFilter(img, ddepth=-1, ksize=kernel))
-  E_X2 = cv2.boxFilter(img * img, ddepth=-1, ksize=kernel)
-  return E_X2 - EX_2
-
-def solve_distance_eq(wds, sigmas):
-  x_list = np.array(wds, np.float32)
-  y_orig_list = np.array(sigmas, np.float32)
-
-  best_solution = (0, 0, 0, 0)
-  critical_x = x_list[np.argmin(y_orig_list)]
-  
-  for x in [critical_x + 1e-6, critical_x - 1e-6]:
-    y_list = [(2 * int(x_list[i] < x) - 1) * y_orig_list[i] \
-        for i in range(len(y_orig_list))]
-    a, b, r, p, stderr = stats.linregress(x_list, y_list)
-    if abs(r) > abs(best_solution[2]):
-      best_solution = (a, -b / a, abs(r), y_list)
-  return best_solution
-
-def gen_disk_filters(radii):
-  filters = [skmorph.disk(abs(r)) for r in radii]
-  filters = [np.array(filter, np.float32) / np.sum(filter) \
-      for filter in filters]
-  return filters
 
 def align_images(imgs, benchmark_img):
   print('Aligning images...')
@@ -167,7 +139,7 @@ def align_images(imgs, benchmark_img):
 
 def get_focused_image(imgs):
   print('Generating Refocused image...')
-  vars = [variance_box_filter(img, VAR_EST_WINDOW_SIZE) for img in imgs]
+  vars = [utils.variance_box_filter(img, VAR_EST_WINDOW_SIZE) for img in imgs]
   max_indices = np.argmax(vars, axis=0)
   focused_img = np.array(imgs[0], np.uint8)
   for y in range(focused_img.shape[0]):
@@ -199,10 +171,10 @@ def estimate_blurry_maps(imgs, benchmark, mode='gaussian', filter_param=[]):
         for var in filter_param]
   elif mode == 'softmax':
     blurry_stack = [filter_with_softmax(benchmark, filter) \
-        for filter in gen_disk_filters(filter_param)]
+        for filter in utils.gen_disk_filters(filter_param)]
   elif mode == 'disk':
     blurry_stack = [cv2.filter2D(benchmark, -1, filter) \
-        for filter in gen_disk_filters(filter_param)]
+        for filter in utils.gen_disk_filters(filter_param)]
 
   boxsize = (BLUR_EST_WINDOW_SIZE, BLUR_EST_WINDOW_SIZE)
   all_ssd_stack = np.array([[
@@ -211,27 +183,6 @@ def estimate_blurry_maps(imgs, benchmark, mode='gaussian', filter_param=[]):
       for blur in blurry_stack] \
       for img in imgs])
   return all_ssd_stack
-
-def estimate_depth(wds, blurry_maps):
-  print('Estimating depth image...')
-  blurry_maps = np.array(blurry_maps, np.float32)
-  depth_map = np.zeros(blurry_maps[0].shape, np.float32)
-  slope_map = np.zeros(depth_map.shape, np.float32)
-  confidence_map = np.zeros(depth_map.shape, np.float32)
-  for y in range(blurry_maps.shape[1]):
-    if y % 10 == 0:
-      print('\tProcesed: ' + str(y) + '/' + str(blurry_maps.shape[1]))
-    for x in range(blurry_maps.shape[2]):
-      solution = solve_distance_eq(wds, blurry_maps[:, y, x])
-      blurry_maps[:, y, x] = solution[3]
-      depth_map[y, x] = solution[1]
-      slope_map[y, x] = solution[0]
-      confidence_map[y, x] = solution[2]
-
-  top_confidence = np.percentile(confidence_map, DEPTH_SLOPE_EST_CONFIDENCE)
-  a_refined = np.mean(slope_map[confidence_map > top_confidence])
-  depth_map_refined = np.mean(wds) - np.mean(blurry_maps, axis=0) / a_refined
-  return depth_map_refined, confidence_map
 
 def estimate_a(wds, radii, blurry_stacks, samples):
   print('Estimating ratio of blurriness and working distance...')
@@ -244,7 +195,7 @@ def estimate_a(wds, radii, blurry_stacks, samples):
   min_rd = np.min(radii)
   max_rd = np.max(radii)
   min_a = max(radii) * max_wd / (min_wd - max_wd)
-  init = [-1400, np.mean(wds)]
+  init = [-40, np.mean(wds)]
 
   # Second dimension is [y, x, a, d, energy]
   sample_results = np.zeros((len(samples), 5))
@@ -271,14 +222,14 @@ def estimate_a(wds, radii, blurry_stacks, samples):
     #       line=sol.x)
 
   viz.plot_scatter(sample_results[:, 2], sample_results[:, 4], \
-      outpath='./chem_data_out/sample_fit.png')
+      outpath='./doll_data_out/sample_fit.png')
   qualified = sample_results[:, 4] < np.percentile(sample_results[:, 4], 80)
   avg_a = np.average(sample_results[qualified, 2])
   std_a = np.std(sample_results[qualified, 2])
   print('a=%.2f, std=%.2f' % (avg_a, std_a))
   return avg_a, std_a
 
-def estimate_distances(wds, radii, blurry_stacks, a, mask):
+def estimate_distances(wds, radii, blurry_stacks, a, mask, focused_img):
   print('Estimating distances of foreground pixels...')
   blurry_stacks = np.array(blurry_stacks, np.float32)
 
@@ -308,11 +259,17 @@ def estimate_distances(wds, radii, blurry_stacks, a, mask):
       spline = interpolate.RectBivariateSpline(inv_wds, radii, \
           ssd, kx=1, ky=1)
       # f = \int_{w_min}^{w_max}spline(1/w, a(d/w-1))
-      sum_func = lambda d: sum(spline(inv_wd, a * (d[0] * inv_wd - 1)) \
+      sum_func = lambda d: sum(spline(inv_wd, a * (d * inv_wd - 1)) \
           for inv_wd in np.linspace(1.0 / max_wd, 1.0 / min_wd, num=100))
-      sol = optimize.minimize(sum_func, [init], bounds=[(min_wd, max_wd)])
-      depth_map[y, x] = sol.x[0]
+      sol = optimize.minimize_scalar(sum_func, \
+          bounds=[min_wd, max_wd], method='bounded')
+      depth_map[y, x] = sol.x
       conf_map[y, x] = sum_func(sol.x)
+      if count % 10000 == 0:
+        viz.normalize_and_draw(depth_map, './doll_data_out/depth_map.png', 0)
+        viz.normalize_and_draw(conf_map, './doll_data_out/conf_map.png', 0)
+        model.output_ply_file(depth_map, focused_img, \
+            './doll_data_out/model.ply', pixel_size=PIXEL_SIZE)
   return depth_map, conf_map
 
 # Smooth the depth map.
@@ -354,25 +311,25 @@ def extract_foreground(img, rect):
   return pos_mask
 
 def main_chem():
-  imgs = read_chem_images('./chem_data/', resize_factor=0.5)
+  imgs = read_chem_images('./chem_data/')
   imgs, _ = align_images(imgs, np.array(imgs[3]))
   wds = CHEM_DATA_WD
   focused_img = get_focused_image(imgs)
   cv2.imwrite('./chem_data_out/focused_image.tiff', focused_img)
 
   all_blurry_stacks = estimate_blurry_maps(imgs, focused_img, mode='gaussian',
-      filter_param=BLURRY_STACK_SIGMAS)
+      filter_param=BLURRY_STACK_RADII)
   
   orb = cv2.ORB_create()
   benchmark_features = orb.detectAndCompute(focused_img, mask=None)
   samples = np.array([f.pt for f in benchmark_features[0]], np.uint32)
 
-  a, std = estimate_a(wds, BLURRY_STACK_SIGMAS, \
+  a, std = estimate_a(wds, BLURRY_STACK_RADII, \
       all_blurry_stacks, samples=samples)
 
   mask = np.ones(focused_img.shape)
-  depth_map, conf_map = estimate_distances(wds, BLURRY_STACK_SIGMAS, \
-      all_blurry_stacks, a, mask)
+  depth_map, conf_map = estimate_distances(wds, BLURRY_STACK_RADII, \
+      all_blurry_stacks, a, mask, focused_img)
 
   # smooth_depth = smooth_depth_map(depth_map, conf_map, 60)
   viz.normalize_and_draw(depth_map, './chem_data_out/depth_map.tiff', 0)
@@ -401,7 +358,7 @@ def main_doll():
   mask = extract_foreground(benchmark_img, (95, 116, 900, 620))
 
   depth_map, conf_map = estimate_distances(wds, BLURRY_STACK_RADII, \
-      all_blurry_stacks, a, mask)
+      all_blurry_stacks, a, mask, benchmark_img)
   # smooth_depth = smooth_depth_map(depth_map, conf_map, 60)
   viz.normalize_and_draw(depth_map, './doll_data_out/depth_map.jpg', 0)
 
@@ -410,4 +367,4 @@ def main_doll():
       pixel_size = PIXEL_SIZE / scale)
 
 if __name__ == '__main__':
-  main_chem()
+  main_doll()
