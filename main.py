@@ -6,18 +6,14 @@ import random
 from scipy import stats
 from scipy import optimize
 from scipy import interpolate
-import pyexifinfo as pei
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.lines as lines
-from lib import model, utils, viz
+from lib import image, model, utils, viz
 
 # [Aligning Phase] Maximum acceptable distance when calculating matches of 
 # ORB features.
 MAXIMUM_ACCEPTABLE_HAMMING_DISTANCE = 20
-# [Refocusing Phase] Window size when calculating variance for surrounding
-# patch of a pixel.
-VAR_EST_WINDOW_SIZE = 15
 # [Depth Map Phase] Stdandard deviations of Gaussian blurring kernels when
 # estimating blurry-ness of pixels in an image.
 BLURRY_STACK_RADII = np.arange(-20, 21)
@@ -72,9 +68,8 @@ def read_camera_images(blurry_path, benchmark_path, resize_factor=1.0):
       resize_factor, grayscale=False) \
       if benchmark_path is not None else None
 
-  exifs = [pei.get_json(blurry_path + filename)[0] \
-      for filename in img_filenames]
-  wds = [float(exif['MakerNotes:FocusDistance'][:-2]) for exif in exifs]
+  wds = image.extract_wd_from_exif(\
+      [blurry_path + filename for filename in img_filenames])
   print(wds)
   return imgs, benchmark_img, wds
 
@@ -136,25 +131,6 @@ def align_images(imgs, benchmark_img):
       cropbox[0, 0] : cropbox[0, 1], \
       cropbox[1, 0] : cropbox[1, 1]]
   return cropped_imgs, cropped_benchmark_img
-
-def get_focused_image(imgs):
-  print('Generating Refocused image...')
-  vars = [utils.variance_box_filter(img, VAR_EST_WINDOW_SIZE) for img in imgs]
-  max_indices = np.argmax(vars, axis=0)
-  focused_img = np.array(imgs[0], np.uint8)
-  for y in range(focused_img.shape[0]):
-    for x in range(focused_img.shape[1]):
-      if focused_img.ndim == 2:
-        focused_img[y, x] = imgs[max_indices[y, x]][y, x]
-      else:
-        focused_img[y, x, :] = imgs[max_indices[y, x]][y, x, :]
-  return focused_img
-
-def filter_with_softmax(img, filter):
-  exp_sig = np.exp(img * EXPO_CONST / 255.0)
-  exp_sig = cv2.filter2D(exp_sig, -1, filter)
-  sig = np.log(exp_sig) * 255.0 / EXPO_CONST
-  return sig
   
 def estimate_blurry_maps(imgs, benchmark, mode='gaussian', filter_param=[]):
   print('Estimating blurry-ness of image stacks...')
@@ -170,7 +146,7 @@ def estimate_blurry_maps(imgs, benchmark, mode='gaussian', filter_param=[]):
         np.float32) \
         for var in filter_param]
   elif mode == 'softmax':
-    blurry_stack = [filter_with_softmax(benchmark, filter) \
+    blurry_stack = [image.filter_by_energy(benchmark, filter) \
         for filter in utils.gen_disk_filters(filter_param)]
   elif mode == 'disk':
     blurry_stack = [cv2.filter2D(benchmark, -1, filter) \
@@ -314,7 +290,7 @@ def main_chem():
   imgs = read_chem_images('./chem_data/')
   imgs, _ = align_images(imgs, np.array(imgs[3]))
   wds = CHEM_DATA_WD
-  focused_img = get_focused_image(imgs)
+  focused_img = image.refocus_image(imgs)
   cv2.imwrite('./chem_data_out/focused_image.tiff', focused_img)
 
   all_blurry_stacks = estimate_blurry_maps(imgs, focused_img, mode='gaussian',
@@ -367,4 +343,4 @@ def main_doll():
       pixel_size = PIXEL_SIZE / scale)
 
 if __name__ == '__main__':
-  main_doll()
+  main_chem()

@@ -13,7 +13,7 @@ def normalize_and_draw(img, outpath, norm_percentile):
 
     Args:
         img: Input image as a numpy array.
-        outpath: Absolute path to output the image.
+        outpath: Path to output the image.
         norm_percentile: top- and bottom-percentile of pixel values to be
                          truncated as outliers.
   """
@@ -32,7 +32,7 @@ def visualize_grid_map(values, x, y, outpath=None, line=None):
                 the function value f(yi, xj).
         x: A 1-d array of length m representing x-values of the grid points.
         y: A 1-d array of length n representing y-values of the grid points.
-        outpath: Absolute output path of the visualized image. If none, will
+        outpath: Output path of the visualized image. If none, will
                  display the image on a new window.
         line: Optionally renders a fitted line on the image if specified. This
               param should be a 1-d array of length 2 (say [a, b]), representing

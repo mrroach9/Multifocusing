@@ -7,7 +7,7 @@ def output_ply_file(depth, img, outpath, pixel_size):
         depth: A 2-d matrix representing the depth of each pixel.
         img: The image representing the texture of the model. If it's 3-channel,
              the colors are BGR; if 1-channel, it represents the grayscale.
-        outpath: The absolute path to save the model.
+        outpath: The path to save the model to.
         pixel_size: Physical size of each pixel.
   """
   print('Outputting depth map to PLY file ' + outpath + '...')
@@ -32,9 +32,9 @@ def output_ply_file(depth, img, outpath, pixel_size):
     for j in range(W):
       # Our depth map is using a right-hand coordinate system:
       # X+: right, Y+: down, Z+: back.
-      # Most 3D model viewer softwares use a different right-hand coordinate
-      # system:
-      # X+: right, Y+: up, Z+: front.
+      # Most of the 3D model viewer softwares use a different right-hand
+      # coordinate system:
+      #     X+: right, Y+: up, Z+: front.
       y = - pixel_size * i# * depth[i, j]
       x = pixel_size * j# * depth[i, j]
       z = - depth[i, j]
