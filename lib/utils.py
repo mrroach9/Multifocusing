@@ -73,3 +73,27 @@ def gen_disk_filters(radii):
   filters = [np.array(filter, np.float32) / np.sum(filter) \
       for filter in filters]
   return filters
+
+def calc_max_incribed_rect(trans, shape):
+  """
+    For a given set of affine transformations (H0=I, H1, H2, ... Hn), and a 
+    rectangular shape S, calculate the maximum rectangular that can be inscribed
+    in Hi*S, with edges parallel to axes.
+
+    Args:
+        trans: A list of affine transformations, note that I is not included.
+        shape: A rectangular to be transformed by trans.
+    Returns:
+        The maximum inscribed rectangular.
+  """
+  trans = trans + [np.array([[1, 0, 0], [0, 1, 0]], np.float32)]
+  topleft = [tran.dot([0, 0, 1]) for tran in trans]
+  topright = [tran.dot([shape[0] - 1, 0, 1]) for tran in trans]
+  bottomleft = [tran.dot([0, shape[1] - 1, 1]) for tran in trans]
+  bottomright = [tran.dot([shape[0] - 1, shape[1] - 1, 1]) for tran in trans]
+
+  topedge = math.ceil(np.max(np.array(topleft + topright)[:, 1]))
+  bottomedge = math.floor(np.min(np.array(bottomleft + bottomright)[:, 1]))
+  leftedge = math.ceil(np.max(np.array(topleft + bottomleft)[:, 0]))
+  rightedge = math.floor(np.min(np.array(topright + bottomright)[:, 0]))
+  return np.array([[topedge, bottomedge], [leftedge, rightedge]], np.uint32)

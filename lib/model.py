@@ -1,4 +1,5 @@
-def output_ply_file(depth, img, outpath, pixel_size):
+def output_ply_file(depth, img, outpath, pixel_size=None, sensor_size=None, \
+    focal_length=None):
   """
     Output depth map into a PLY format 3D object, with benchmark image as
     vertex colors.
@@ -8,11 +9,21 @@ def output_ply_file(depth, img, outpath, pixel_size):
         img: The image representing the texture of the model. If it's 3-channel,
              the colors are BGR; if 1-channel, it represents the grayscale.
         outpath: The path to save the model to.
-        pixel_size: Physical size of each pixel.
+        pixel_size: Optional, physical size of each pixel, in mm.
+        sensor_size: Optional, a pair of camera sensor size (width, height)
+                     in mm. Note that either pixel_size is specified, or both
+                     sensor_size and focal_length are specified.
+        focal_length: Optional, focal length of the camera, in mm.
   """
   print('Outputting depth map to PLY file ' + outpath + '...')
   H = depth.shape[0]
   W = depth.shape[1]
+  pixel_size_func = None
+  if pixel_size is None:
+    pixel_size_func = lambda d: \
+        sensor_size[0] * d / (W * focal_length) - sensor_size[0] / W
+  else:
+    pixel_size_func = lambda d: pixel_size
 
   # Writing header.
   f = open(outpath, 'w+')
@@ -35,8 +46,8 @@ def output_ply_file(depth, img, outpath, pixel_size):
       # Most of the 3D model viewer softwares use a different right-hand
       # coordinate system:
       #     X+: right, Y+: up, Z+: front.
-      y = - pixel_size * i# * depth[i, j]
-      x = pixel_size * j# * depth[i, j]
+      y = - pixel_size_func(depth[i, j]) * (i - H / 2.0)
+      x = pixel_size_func(depth[i, j]) * (j - W / 2.0)
       z = - depth[i, j]
       c = img[i, j]
       if img.ndim == 2:

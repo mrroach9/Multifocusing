@@ -1,3 +1,4 @@
+import cv2
 import numpy as np
 import pyexifinfo as pei
 from .utils import variance_box_filter
@@ -16,10 +17,10 @@ def extract_wd_from_exif(filepaths):
     Args:
         filepaths: List of paths for images to extract working distances.
     Returns:
-        wds: A list of floating point numbers of working distances.
+        wds: A list of floating point numbers of working distances, in mm.
   """
   exifs = [pei.get_json(filepath)[0] for filepath in filepaths]
-  wds = [float(exif['MakerNotes:FocusDistance'][:-2]) for exif in exifs]
+  wds = [float(exif['MakerNotes:FocusDistance'][:-2]) * 1000 for exif in exifs]
   return wds
 
 def filter_by_energy(img, filter, expo_const=DEFAULT_EXPO_CONST):
@@ -74,3 +75,28 @@ def refocus_image(imgs, var_window_size=DEFAULT_VAR_EST_WINDOW_SIZE):
       else:
         focused_img[y, x, :] = imgs[max_indices[y, x]][y, x, :]
   return focused_img
+
+def extract_foreground(img, rect):
+  """
+    Extracts a continuous area as foreground of an image, bounded by a specified
+    rectangle. This method uses GrabCut algorithm.
+
+    Args:
+        img: Input image for segmentation.
+        rect: Input rectangle bounding the foreground area, in format
+              [left, top, width, height].
+    Returns:
+        pos_mask: A 0-1 matrix with the same shape as input image, where 0
+                  represents possible background pixels and 1 represents
+                  foreground.
+  """ 
+  mask = np.zeros(img.shape[:2], np.uint8)
+  bgdModel = np.zeros((1, 65), np.float64)
+  fgdModel = np.zeros((1, 65), np.float64)
+  cv2.grabCut(img, mask, tuple(np.array(rect, np.uint32)), \
+      bgdModel, fgdModel, 5, mode=cv2.GC_INIT_WITH_RECT)
+  pos_mask = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
+  morph_kernel = np.ones((5, 5), np.uint8)
+  pos_mask = cv2.morphologyEx(pos_mask, cv2.MORPH_OPEN, morph_kernel)
+  pos_mask = cv2.morphologyEx(pos_mask, cv2.MORPH_CLOSE, morph_kernel)
+  return pos_mask

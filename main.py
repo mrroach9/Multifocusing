@@ -2,13 +2,9 @@ import os
 import math
 import cv2
 import numpy as np
-import random
-from scipy import stats
 from scipy import optimize
 from scipy import interpolate
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import matplotlib.lines as lines
 from lib import image, model, utils, viz
 
 # [Aligning Phase] Maximum acceptable distance when calculating matches of 
@@ -28,7 +24,7 @@ BLUR_EST_WINDOW_SIZE = 25 # Camera
 DEPTH_SLOPE_EST_CONFIDENCE = 90
 DEPTH_SAMPLING_RATIO = 0.01
 # VERY_FAR = 3700 # Chem
-VERY_FAR = 0.7  # Camera
+VERY_FAR = 660  # Camera
 # [Smoothing Phase] When smoothing the image, we first need to remove 
 # extreme outliers. In percenage. 0.8 means remove the highest 0.8% and the 
 # lowest 0.8%.
@@ -42,7 +38,12 @@ EXPO_CONST = 5.0
 
 CHEM_DATA_WD = [3620, 3630, 3633.726, 3640, 3650, 3660, 3670]
 # PIXEL_SIZE = 0.055  # Chem 
-PIXEL_SIZE = 0.0001 # Camera
+APS_C_SENSOR_SIZE = (23.5, 15.6) # Camera, in mm
+FOCAL_LENGTH = 35 # Camera, in mm
+FOREGROUND_RECT = [1327, 829, 3391, 2555]
+
+# Camera, in mm
+DOLL_DATA_WD = [470, 485, 500, 520, 540, 550, 570, 590, 610, 630, 650, 700]
 
 def read_and_preprocess(filename, resize_factor=1.0, grayscale=True):
   img = cv2.imread(filename, \
@@ -73,18 +74,7 @@ def read_camera_images(blurry_path, benchmark_path, resize_factor=1.0):
   print(wds)
   return imgs, benchmark_img, wds
 
-def calc_max_incribed_square(trans, shape):
-  trans = trans + [np.array([[1, 0, 0], [0, 1, 0]], np.float32)]
-  topleft = [tran.dot([0, 0, 1]) for tran in trans]
-  topright = [tran.dot([shape[0] - 1, 0, 1]) for tran in trans]
-  bottomleft = [tran.dot([0, shape[1] - 1, 1]) for tran in trans]
-  bottomright = [tran.dot([shape[0] - 1, shape[1] - 1, 1]) for tran in trans]
 
-  topedge = math.ceil(np.max(np.array(topleft + topright)[:, 1]))
-  bottomedge = math.floor(np.min(np.array(bottomleft + bottomright)[:, 1]))
-  leftedge = math.ceil(np.max(np.array(topleft + bottomleft)[:, 0]))
-  rightedge = math.floor(np.min(np.array(topright + bottomright)[:, 0]))
-  return np.array([[topedge, bottomedge], [leftedge, rightedge]], np.uint32)
 
 def align_images(imgs, benchmark_img):
   print('Aligning images...')
@@ -121,7 +111,7 @@ def align_images(imgs, benchmark_img):
     aligned_imgs += [cv2.warpAffine(orig_img, mat, dsize=None, dst=None)]
   
   # Crop images to the maximum square enclosed in all transformed images.
-  cropbox = calc_max_incribed_square(translations, \
+  cropbox = utils.calc_max_incribed_rect(translations, \
       [orig_benchmark_img.shape[1], orig_benchmark_img.shape[0]])
   cropped_imgs = [ \
       img[cropbox[0, 0] : cropbox[0, 1], \
@@ -171,7 +161,7 @@ def estimate_a(wds, radii, blurry_stacks, samples):
   min_rd = np.min(radii)
   max_rd = np.max(radii)
   min_a = max(radii) * max_wd / (min_wd - max_wd)
-  init = [-40, np.mean(wds)]
+  init = [-20, np.mean(wds)]
 
   # Second dimension is [y, x, a, d, energy]
   sample_results = np.zeros((len(samples), 5))
@@ -188,12 +178,12 @@ def estimate_a(wds, radii, blurry_stacks, samples):
     sum_func = lambda x: sum(spline(inv_wd, x[0] * (x[1] * inv_wd - 1)) \
         for inv_wd in np.linspace(1.0 / max_wd, 1.0 / min_wd, num=100))
     sol = optimize.minimize(sum_func, init, \
-        bounds=[(min_a, 0.0), (min_wd, max_wd)])
+        bounds=[(min_a, 0.0), (min_wd, max_wd)], tol=0.01)
     sample_results[i, :] = [y, x, sol.x[0], sol.x[1], sum_func(sol.x)]
 
     # if i % 10 == 0:
     #   viz.visualize_grid_map(ssd, inv_wds, radii, \
-    #       outpath='./chem_data_out/%d_%d_%d_%.2f_%.2f.png' \
+    #       outpath='./doll_data_out/%d_%d_%d_%.2f_%.2f.png' \
     #           % (i+1, x, y, sol.x[0], sol.x[1]), \
     #       line=sol.x)
 
@@ -202,7 +192,6 @@ def estimate_a(wds, radii, blurry_stacks, samples):
   qualified = sample_results[:, 4] < np.percentile(sample_results[:, 4], 80)
   avg_a = np.average(sample_results[qualified, 2])
   std_a = np.std(sample_results[qualified, 2])
-  print('a=%.2f, std=%.2f' % (avg_a, std_a))
   return avg_a, std_a
 
 def estimate_distances(wds, radii, blurry_stacks, a, mask, focused_img):
@@ -238,14 +227,15 @@ def estimate_distances(wds, radii, blurry_stacks, a, mask, focused_img):
       sum_func = lambda d: sum(spline(inv_wd, a * (d * inv_wd - 1)) \
           for inv_wd in np.linspace(1.0 / max_wd, 1.0 / min_wd, num=100))
       sol = optimize.minimize_scalar(sum_func, \
-          bounds=[min_wd, max_wd], method='bounded')
+          bounds=[min_wd, max_wd], method='bounded', tol=1.0)
       depth_map[y, x] = sol.x
       conf_map[y, x] = sum_func(sol.x)
       if count % 10000 == 0:
         viz.normalize_and_draw(depth_map, './doll_data_out/depth_map.png', 0)
         viz.normalize_and_draw(conf_map, './doll_data_out/conf_map.png', 0)
         model.output_ply_file(depth_map, focused_img, \
-            './doll_data_out/model.ply', pixel_size=PIXEL_SIZE)
+            './doll_data_out/raw_model.ply', \
+            sensor_size=APS_C_SENSOR_SIZE, focal_length=FOCAL_LENGTH)
   return depth_map, conf_map
 
 # Smooth the depth map.
@@ -277,15 +267,6 @@ def smooth_depth_map(depth, conf, percentile):
       DEPTH_SMOOTH_GAUSSIAN_BLUR_SIGMA)
   return smooth_depth
 
-def extract_foreground(img, rect):
-  mask = np.zeros(img.shape[:2], np.uint8)
-  bgdModel = np.zeros((1, 65), np.float64)
-  fgdModel = np.zeros((1, 65), np.float64)
-  cv2.grabCut(img, mask, rect, bgdModel, fgdModel, 5, \
-      mode=cv2.GC_INIT_WITH_RECT)
-  pos_mask = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
-  return pos_mask
-
 def main_chem():
   imgs = read_chem_images('./chem_data/')
   imgs, _ = align_images(imgs, np.array(imgs[3]))
@@ -315,11 +296,20 @@ def main_chem():
 
 def main_doll():
   scale = 0.2
-  imgs, benchmark_img, wds = read_camera_images(
-      './doll_data/single/', './doll_data/benchmark.JPG', resize_factor=scale)
+  imgs, _, _ = read_camera_images(
+      './doll_data/f4.0/', None, resize_factor=scale)
+  wds = DOLL_DATA_WD
+
+  benchmark_img = imgs[5]
+  original_size = benchmark_img.shape
   imgs, benchmark_img = align_images(imgs, benchmark_img)
-  
   cv2.imwrite('./doll_data_out/benchmark_cropped.jpg', benchmark_img)
+
+  #(95, 116, 900, 620)
+  mask = image.extract_foreground(benchmark_img, \
+      np.array(FOREGROUND_RECT) * scale)
+  cv2.imwrite('./doll_data_out/foreground.jpg', mask * 255)
+
   all_blurry_stacks = estimate_blurry_maps(imgs, benchmark_img, \
       mode='softmax', filter_param=BLURRY_STACK_RADII)
 
@@ -331,8 +321,6 @@ def main_doll():
       all_blurry_stacks, samples=samples)
   print('Estimated a = %f with standard variation %f' % (a, std))
 
-  mask = extract_foreground(benchmark_img, (95, 116, 900, 620))
-
   depth_map, conf_map = estimate_distances(wds, BLURRY_STACK_RADII, \
       all_blurry_stacks, a, mask, benchmark_img)
   # smooth_depth = smooth_depth_map(depth_map, conf_map, 60)
@@ -340,7 +328,7 @@ def main_doll():
 
   model.output_ply_file(depth_map, benchmark_img, \
       './doll_data_out/raw_model.ply', \
-      pixel_size = PIXEL_SIZE / scale)
+      sensor_size=APS_C_SENSOR_SIZE, focal_length=FOCAL_LENGTH)
 
 if __name__ == '__main__':
-  main_chem()
+  main_doll()
