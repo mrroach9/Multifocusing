@@ -1,5 +1,5 @@
 def output_ply_file(depth, img, outpath, pixel_size=None, sensor_size=None, \
-    focal_length=None):
+    focal_length=None, break_thresh=1e9):
   """
     Output depth map into a PLY format 3D object, with benchmark image as
     vertex colors.
@@ -14,6 +14,9 @@ def output_ply_file(depth, img, outpath, pixel_size=None, sensor_size=None, \
                      in mm. Note that either pixel_size is specified, or both
                      sensor_size and focal_length are specified.
         focal_length: Optional, focal length of the camera, in mm.
+        break_threash: Optional, if two adjacent pixels' depths differ greater
+                       than this value, no edges or faces will be drawn between
+                       them.
   """
   print('Outputting depth map to PLY file ' + outpath + '...')
   H = depth.shape[0]
@@ -24,6 +27,16 @@ def output_ply_file(depth, img, outpath, pixel_size=None, sensor_size=None, \
         sensor_size[0] * d / (W * focal_length) - sensor_size[0] / W
   else:
     pixel_size_func = lambda d: pixel_size
+
+  # Pre-calculate number of faces.
+  num_faces = 0
+  for i in range(H - 1):
+    for j in range(W - 1):
+      depths = [depth[i, j], depth[i + 1, j], \
+                depth[i, j + 1], depth[i + 1, j + 1]]
+      if max(depths) - min(depths) > break_thresh:
+        continue
+      num_faces += 2
 
   # Writing header.
   f = open(outpath, 'w+')
@@ -36,7 +49,7 @@ def output_ply_file(depth, img, outpath, pixel_size=None, sensor_size=None, \
   f.write('property uchar red\n')
   f.write('property uchar green\n')
   f.write('property uchar blue\n')
-  f.write('element face %d\n' % (2 * (W - 1) * (H - 1)))
+  f.write('element face %d\n' % num_faces)
   f.write('property list uchar int vertex_index\n')
   f.write('end_header\n')
   for i in range(H):
@@ -63,6 +76,10 @@ def output_ply_file(depth, img, outpath, pixel_size=None, sensor_size=None, \
   # We will output two triangles: (1, 3, 4) and (4, 2, 1).
   for i in range(H - 1):
     for j in range(W - 1):
+      depths = [depth[i, j], depth[i + 1, j], \
+                depth[i, j + 1], depth[i + 1, j + 1]]
+      if max(depths) - min(depths) > break_thresh:
+        continue
       f.write('3 %d %d %d\n' % \
           (i * W + j, (i + 1) * W + j, (i + 1) * W + j + 1))
       f.write('3 %d %d %d\n' % \

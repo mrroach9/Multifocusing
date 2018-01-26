@@ -1,6 +1,8 @@
 import cv2
+import math
 import numpy as np
-import skimage.morphology as skmorph
+import skimage.morphology as morph
+import skimage.measure as measure
 
 def normalize(mat, percentile=0, scale=None):
   """
@@ -30,7 +32,7 @@ def normalize(mat, percentile=0, scale=None):
   if scale is None:
     scale = orig_scale
   out *= (scale / orig_scale)
-  return out, orig_scale / scale
+  return out, orig_scale / scale, lower
 
 def variance_box_filter(img, boxsize):
   """
@@ -55,6 +57,14 @@ def variance_box_filter(img, boxsize):
   E_X2 = cv2.boxFilter(img * img, ddepth=-1, ksize=kernel)
   return E_X2 - EX_2
 
+def sum_box_filter(img, boxsize):
+  if img.ndim == 3:
+    img = np.array(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), np.float32)
+  else:
+    img = np.array(img, np.float32)
+  kernel = (boxsize, boxsize)
+  return cv2.boxFilter(img, ddepth=-1, ksize=kernel)
+
 def gen_disk_filters(radii):
   """
     Generates disk filters for a list of specified radii.
@@ -69,9 +79,24 @@ def gen_disk_filters(radii):
     Returns:
         filters: A list of generated disk filters.
   """
-  filters = [skmorph.disk(abs(r)) for r in radii]
-  filters = [np.array(filter, np.float32) / np.sum(filter) \
-      for filter in filters]
+  filters = []
+  block = 4
+  for r in radii:
+    if abs(r) <= 1:
+      filters += [np.identity(1, dtype=np.float32)]
+      continue
+    half_size = math.floor(abs(r)) + 1
+    size = block * (2 * half_size + 1)
+    f = np.zeros([size, size], np.float32)
+    for i in range(size):
+      for j in range(size):
+        if (i + 0.5 - size / 2) ** 2 + (j + 0.5 - size / 2) ** 2 <= \
+            block * block * r * r:
+          f[i, j] = 1
+    f = measure.block_reduce(f, (block, block), np.mean)
+    if np.sum(f) > 0:
+      f /= np.sum(f)
+    filters += [f]
   return filters
 
 def calc_max_incribed_rect(trans, shape):

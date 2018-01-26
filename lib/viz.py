@@ -17,7 +17,7 @@ def normalize_and_draw(img, outpath, norm_percentile):
         norm_percentile: top- and bottom-percentile of pixel values to be
                          truncated as outliers.
   """
-  outimg, _ = normalize(img, norm_percentile, 255.0)
+  outimg, _, _ = normalize(img, norm_percentile, 255.0)
   outimg = np.array(outimg, np.uint8)
   cv2.imwrite(outpath, outimg)
 
@@ -56,6 +56,7 @@ def visualize_grid_map(values, x, y, outpath=None, line=None):
     plt.show()
   else:
     plt.savefig(outpath)
+  plt.clf()
 
 def plot_scatter(x, y, percentile=100, outpath=None):
   x = x[y < np.percentile(y, percentile)]
@@ -67,3 +68,4 @@ def plot_scatter(x, y, percentile=100, outpath=None):
     plt.show()
   else:
     plt.savefig(outpath)
+  plt.clf()

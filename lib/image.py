@@ -65,7 +65,7 @@ def refocus_image(imgs, var_window_size=DEFAULT_VAR_EST_WINDOW_SIZE):
         extracted from the image with largest variance around that location.
   """
   print('Generating Refocused image...')
-  vars = [variance_box_filter(img, var_window_size) for img in imgs]
+  vars = np.array([variance_box_filter(img, var_window_size) for img in imgs])
   max_indices = np.argmax(vars, axis=0)
   focused_img = np.array(imgs[0], np.uint8)
   for y in range(focused_img.shape[0]):

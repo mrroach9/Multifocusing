@@ -1,30 +1,32 @@
 import os
-import math
 import cv2
 import numpy as np
 from scipy import optimize
+from scipy import misc
+from scipy import integrate
 from scipy import interpolate
 import matplotlib.pyplot as plt
+import random
+import math
 from lib import image, model, utils, viz
 
 # [Aligning Phase] Maximum acceptable distance when calculating matches of 
 # ORB features.
 MAXIMUM_ACCEPTABLE_HAMMING_DISTANCE = 20
+CAMERA_CORRECTION_LAMBDA = 1.0
+CAMERA_CORRECTION_BUCKET = 5
 # [Depth Map Phase] Stdandard deviations of Gaussian blurring kernels when
 # estimating blurry-ness of pixels in an image.
-BLURRY_STACK_RADII = np.arange(-20, 21)
+MAX_BLURRY_RADIUS = 100.0
+BLURRY_STACK_SIZE = 93
+INTEGRATION_STEPS = 29
+IMG_SUM_SIZE = 25
 # [Depth Map Phase] Window size to calculate difference between blurred
 # refocused image and original image.
 # BLUR_EST_WINDOW_SIZE = 5  # Chem
-BLUR_EST_WINDOW_SIZE = 25 # Camera
-# [Depth Map Phase] Relationship between blurry-ness and working distance can
-# be estimated by a linear formula b = a * (WD - c). where a is only related to
-# device intrinsic params and c is related to distance of a point. When
-# estimating a across pixels, we only pick those with high confidence.
-DEPTH_SLOPE_EST_CONFIDENCE = 90
-DEPTH_SAMPLING_RATIO = 0.01
+BLUR_EST_WINDOW_SIZE = 20 # Camera
 # VERY_FAR = 3700 # Chem
-VERY_FAR = 660  # Camera
+VERY_FAR = 700  # Camera
 # [Smoothing Phase] When smoothing the image, we first need to remove 
 # extreme outliers. In percenage. 0.8 means remove the highest 0.8% and the 
 # lowest 0.8%.
@@ -32,18 +34,13 @@ DEPTH_SMOOTH_TRUNC_THRESHOLD = 1.0
 # [Smoothing Phase] Denoising strength.
 DEPTH_SMOOTH_DENOISE_STRENGTH = 10
 # [Smoothing Phase] Inpainting size.
-DEPTH_SMOOTH_INPAINT_SIZE = 15 # 10
-DEPTH_SMOOTH_GAUSSIAN_BLUR_SIGMA = 4.0 # 3.0
-EXPO_CONST = 5.0
+DEPTH_SMOOTH_INPAINT_SIZE = 30 # 10
 
 CHEM_DATA_WD = [3620, 3630, 3633.726, 3640, 3650, 3660, 3670]
 # PIXEL_SIZE = 0.055  # Chem 
 APS_C_SENSOR_SIZE = (23.5, 15.6) # Camera, in mm
 FOCAL_LENGTH = 35 # Camera, in mm
 FOREGROUND_RECT = [1327, 829, 3391, 2555]
-
-# Camera, in mm
-DOLL_DATA_WD = [470, 485, 500, 520, 540, 550, 570, 590, 610, 630, 650, 700]
 
 def read_and_preprocess(filename, resize_factor=1.0, grayscale=True):
   img = cv2.imread(filename, \
@@ -73,8 +70,6 @@ def read_camera_images(blurry_path, benchmark_path, resize_factor=1.0):
       [blurry_path + filename for filename in img_filenames])
   print(wds)
   return imgs, benchmark_img, wds
-
-
 
 def align_images(imgs, benchmark_img):
   print('Aligning images...')
@@ -122,7 +117,7 @@ def align_images(imgs, benchmark_img):
       cropbox[1, 0] : cropbox[1, 1]]
   return cropped_imgs, cropped_benchmark_img
   
-def estimate_blurry_maps(imgs, benchmark, mode='gaussian', filter_param=[]):
+def estimate_blurry_maps(imgs, scale, benchmark, mode='gaussian', filter_param=[]):
   print('Estimating blurry-ness of image stacks...')
   if imgs[0].ndim == 3:
     imgs = [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) for img in imgs]
@@ -132,7 +127,7 @@ def estimate_blurry_maps(imgs, benchmark, mode='gaussian', filter_param=[]):
   if mode == 'gaussian':
     blurry_stack = [np.array(\
         cv2.GaussianBlur(benchmark, (7, 7), abs(var) * 0.1) \
-            if var !=0 else benchmark, \
+            if var != 0 else benchmark, \
         np.float32) \
         for var in filter_param]
   elif mode == 'softmax':
@@ -142,129 +137,146 @@ def estimate_blurry_maps(imgs, benchmark, mode='gaussian', filter_param=[]):
     blurry_stack = [cv2.filter2D(benchmark, -1, filter) \
         for filter in utils.gen_disk_filters(filter_param)]
 
-  boxsize = (BLUR_EST_WINDOW_SIZE, BLUR_EST_WINDOW_SIZE)
-  all_ssd_stack = np.array([[
-      np.array(cv2.boxFilter(np.square(blur - img), ddepth=-1,
-          ksize=boxsize, normalize=False), np.float32)
+  boxsize = 2 * math.ceil(BLUR_EST_WINDOW_SIZE * scale) + 1
+  all_ssd_stack = np.array([[ \
+      np.array(cv2.GaussianBlur(np.square(blur - img), \
+          (boxsize, boxsize), 0.0), np.float32) \
       for blur in blurry_stack] \
       for img in imgs])
   return all_ssd_stack
 
-def estimate_a(wds, radii, blurry_stacks, samples):
-  print('Estimating ratio of blurriness and working distance...')
+def calc_energy(a, wds, dists, radii, ssds):
+  n = len(wds)
+  m = len(dists)
+  total = 0
+  for i in range(m):
+    splines = [interpolate.interp1d(radii / a + 1, ssds[i][j, :], \
+        kind='linear', fill_value='extrapolate') for j in range(n)]
+    total += sum(splines[j](dists[i] / wds[j]) for j in range(n))
+  return total
+
+def correct_cam_params(ref_wds, radii, blurry_stacks, samples):
+  print('Correcting camera parameters...')
   blurry_stacks = np.array(blurry_stacks, np.float32)
 
-  inv_wds = np.flipud(1.0 / np.array(wds, np.float32))
-  blurry_stacks = np.flipud(blurry_stacks)
-  min_wd = np.min(wds)
-  max_wd = np.max(wds)
-  min_rd = np.min(radii)
-  max_rd = np.max(radii)
-  min_a = max(radii) * max_wd / (min_wd - max_wd)
-  init = [-20, np.mean(wds)]
+  n = len(ref_wds)
+  bucket = CAMERA_CORRECTION_BUCKET
+  lmd = CAMERA_CORRECTION_LAMBDA
+  min_wd = np.min(ref_wds) * 0.9
+  max_wd = np.max(ref_wds) * 1.1
+  max_a = max(radii) * max_wd / (max_wd - min_wd)
+  init = np.array([20] + [np.mean(ref_wds)] * (n + bucket))
 
-  # Second dimension is [y, x, a, d, energy]
-  sample_results = np.zeros((len(samples), 5))
-  for i in range(len(samples)):
+  num_batch = len(samples) // bucket
+  result_a = np.zeros([num_batch], np.float32)
+  result_wds = np.zeros([num_batch, n], np.float32)
+  for i in range(num_batch):
     if (i + 1) % 10 == 0:
-      print('\tMinimizing integrations for sample %d/%d...' % \
-          (i + 1, len(samples)))
-    y = samples[i][1]
-    x = samples[i][0]
-    ssd = blurry_stacks[:, :, y, x]
-    spline = interpolate.RectBivariateSpline(inv_wds, radii, ssd, kx=1, ky=1)
+      print('\tOptimizing batch #%d/#%d...' % (i + 1, num_batch))
+    index_list = [bucket * i + j for j in range(bucket)]
+    ssds = [blurry_stacks[:, :, samples[index, 1], samples[index, 0]] \
+        for index in index_list]
 
-    # x = [a, d], f = \int_{w_min}^{w_max}spline(1/w, a(d/w-1))
-    sum_func = lambda x: sum(spline(inv_wd, x[0] * (x[1] * inv_wd - 1)) \
-        for inv_wd in np.linspace(1.0 / max_wd, 1.0 / min_wd, num=100))
-    sol = optimize.minimize(sum_func, init, \
-        bounds=[(min_a, 0.0), (min_wd, max_wd)], tol=0.01)
-    sample_results[i, :] = [y, x, sol.x[0], sol.x[1], sum_func(sol.x)]
+    energy_func = lambda x: calc_energy(\
+        x[0], x[1 : n + 1], x[n + 1 : ], radii, ssds) \
+        + np.square(ref_wds - x[1 : n + 1]).sum() * lmd
+    sol = optimize.minimize(energy_func, init, \
+        bounds=[(1e-3, max_a)] + [(min_wd, max_wd)] * (n + bucket), \
+        tol=0.01)
+    
+    result_a[i] = sol.x[0]
+    result_wds[i, :] = sol.x[1 : n + 1]
+    init[: n + 1] = sol.x[: n + 1]
+  avg_a = np.mean(result_a)
+  std_a = np.std(result_a)
+  avg_wds = np.mean(result_wds, axis=0)
+  std_wds = math.sqrt(np.mean([np.dot(wd, wd) for wd in result_wds]) \
+      - np.dot(avg_wds, avg_wds))
+  return avg_a, std_a, avg_wds, std_wds
 
-    # if i % 10 == 0:
-    #   viz.visualize_grid_map(ssd, inv_wds, radii, \
-    #       outpath='./doll_data_out/%d_%d_%d_%.2f_%.2f.png' \
-    #           % (i+1, x, y, sol.x[0], sol.x[1]), \
-    #       line=sol.x)
-
-  viz.plot_scatter(sample_results[:, 2], sample_results[:, 4], \
-      outpath='./doll_data_out/sample_fit.png')
-  qualified = sample_results[:, 4] < np.percentile(sample_results[:, 4], 80)
-  avg_a = np.average(sample_results[qualified, 2])
-  std_a = np.std(sample_results[qualified, 2])
-  return avg_a, std_a
-
-def estimate_distances(wds, radii, blurry_stacks, a, mask, focused_img):
+def estimate_distances(wds, radii, blurry_stacks, mask, focused_img, scale):
   print('Estimating distances of foreground pixels...')
   blurry_stacks = np.array(blurry_stacks, np.float32)
+  sum_boxsize = 2 * math.ceil(IMG_SUM_SIZE * scale) + 1
+  sum_img = utils.sum_box_filter(focused_img, sum_boxsize)
 
   H = blurry_stacks.shape[2]
   W = blurry_stacks.shape[3]
-  inv_wds = np.flipud(1.0 / np.array(wds, np.float32))
-  blurry_stacks = np.flipud(blurry_stacks)
   min_wd = np.min(wds)
   max_wd = np.max(wds)
-  min_rd = np.min(radii)
-  max_rd = np.max(radii)
   init = np.mean(wds)
 
   depth_map = VERY_FAR * np.ones([H, W], np.float32)
   conf_map = np.zeros([H, W], np.float32)
   total_pixels = np.count_nonzero(mask)
   count = 0
+#   samples = [[700, 858], [701, 858], [701, 859], [702, 859], [783, 685]]
   for y in range(H):
     for x in range(W):
+#   for p in samples:
+#       y, x = p[1], p[0]
       if mask[y, x] == 0:
         continue
       count += 1
-      if count % 100 == 0:
+      if count % 1000 == 0:
         print('\tMinimizing integrations for #%d/%d...' % (count, total_pixels))
 
       ssd = blurry_stacks[:, :, y, x]
-      spline = interpolate.RectBivariateSpline(inv_wds, radii, \
-          ssd, kx=1, ky=1)
-      # f = \int_{w_min}^{w_max}spline(1/w, a(d/w-1))
-      sum_func = lambda d: sum(spline(inv_wd, a * (d * inv_wd - 1)) \
-          for inv_wd in np.linspace(1.0 / max_wd, 1.0 / min_wd, num=100))
-      sol = optimize.minimize_scalar(sum_func, \
+      
+      spline = interpolate.RectBivariateSpline(wds, radii, ssd, kx=1, ky=1)
+      energy_func = lambda d: sum(spline(wd, d / wd)[0, 0] \
+          for wd in np.linspace(min_wd, max_wd, INTEGRATION_STEPS))
+      sol = optimize.minimize_scalar(energy_func, \
           bounds=[min_wd, max_wd], method='bounded', tol=1.0)
       depth_map[y, x] = sol.x
-      conf_map[y, x] = sum_func(sol.x)
-      if count % 10000 == 0:
-        viz.normalize_and_draw(depth_map, './doll_data_out/depth_map.png', 0)
-        viz.normalize_and_draw(conf_map, './doll_data_out/conf_map.png', 0)
+
+    #   plot_x = np.linspace(min_wd, max_wd, num=100)
+    #   plot_y = [energy_func(x) for x in plot_x]
+    #   plt.plot(plot_x, plot_y)
+    #   plt.savefig('./doll_data_out/sampleplot_%d_%d.png' % (x, y))
+    #   plt.clf()
+    #   viz.visualize_grid_map(ssd, wds, radii, \
+    #       outpath='./doll_data_out/%d_%d_%.2f.png' % (x, y, sol.x))
+
+      conf = misc.derivative(energy_func, sol.x, dx=2.0, n=2, order=5) / sol.fun
+      conf_map[y, x] = np.log(conf / sum_img[y, x] + 1.0)
+
+    #   print('Point (%d, %d): d=%.2f, conf=%.4f, energy=%.2f' % \
+    #       (x, y, depth_map[y, x], conf_map[y, x], sol.fun))
+
+      if count % 100000 == 0:
+        viz.normalize_and_draw(depth_map, './doll_data_out/raw_depth_map.jpg', 0)
+        viz.normalize_and_draw(conf_map, './doll_data_out/conf_map.jpg', 0)
         model.output_ply_file(depth_map, focused_img, \
             './doll_data_out/raw_model.ply', \
-            sensor_size=APS_C_SENSOR_SIZE, focal_length=FOCAL_LENGTH)
+            sensor_size=APS_C_SENSOR_SIZE, focal_length=FOCAL_LENGTH, \
+            break_thresh=5)
   return depth_map, conf_map
 
 # Smooth the depth map.
-def smooth_depth_map(depth, conf, percentile):
+def smooth_depth_map(depth, conf, percentile, fore_mask):
   print('Smoothing depth map with %d-th percentile...' % (percentile))
 
   # Mark pixels with confidence < x percentile as not credible in mask, so that
   # we can inpaint these areas from high-confidence pixels.
   conf_thresh = np.percentile(conf, percentile)
   mask = np.zeros(depth.shape, np.uint8)
-  mask[conf < conf_thresh] = 1
-  depth_with_mask = np.array(depth, np.float32)
-  depth_with_mask[mask == 1] = 0
-  
-  # Remove the extremge 0.8-th percentile from depth map, then apply a
-  # 4-stage smoothing: Denoising, Inpainting, Denoinsing, Gaussian Blurring.
-  norm_depth, scale = utils.normalize(depth, \
-      DEPTH_SMOOTH_TRUNC_THRESHOLD, 255.0)
+  mask[(conf < conf_thresh) & (fore_mask == 1)] = 1
+
+  output_depth = np.array(depth)
+  output_depth[mask == 1] = VERY_FAR
+  viz.normalize_and_draw(output_depth, './doll_data_out/masked_depth.jpg', 0)
+
+  norm_depth, scale, shift = utils.normalize(depth, 0, 255.0)
   smooth_depth = np.array(norm_depth, np.uint8)
-  smooth_depth = cv2.fastNlMeansDenoising(smooth_depth, \
-      h=DEPTH_SMOOTH_DENOISE_STRENGTH)
   smooth_depth = cv2.inpaint(smooth_depth, mask, \
       DEPTH_SMOOTH_INPAINT_SIZE, cv2.INPAINT_TELEA)
+  viz.normalize_and_draw(smooth_depth, './doll_data_out/noisy_depth.jpg', 0)  
   smooth_depth = cv2.fastNlMeansDenoising(smooth_depth, \
       h=DEPTH_SMOOTH_DENOISE_STRENGTH)
   smooth_depth = np.array(smooth_depth, np.float32)
   smooth_depth *= scale
-  smooth_depth = cv2.GaussianBlur(smooth_depth, (0, 0), \
-      DEPTH_SMOOTH_GAUSSIAN_BLUR_SIGMA)
+  smooth_depth += shift
   return smooth_depth
 
 def main_chem():
@@ -296,13 +308,15 @@ def main_chem():
 
 def main_doll():
   scale = 0.2
-  imgs, _, _ = read_camera_images(
+  blurry_radius = MAX_BLURRY_RADIUS * scale
+  radii = np.linspace(-blurry_radius, blurry_radius, BLURRY_STACK_SIZE)
+  imgs, _, ref_wds = read_camera_images(
       './doll_data/f4.0/', None, resize_factor=scale)
-  wds = DOLL_DATA_WD
 
   benchmark_img = imgs[5]
   original_size = benchmark_img.shape
   imgs, benchmark_img = align_images(imgs, benchmark_img)
+  benchmark_img = image.refocus_image(imgs)
   cv2.imwrite('./doll_data_out/benchmark_cropped.jpg', benchmark_img)
 
   #(95, 116, 900, 620)
@@ -310,25 +324,53 @@ def main_doll():
       np.array(FOREGROUND_RECT) * scale)
   cv2.imwrite('./doll_data_out/foreground.jpg', mask * 255)
 
-  all_blurry_stacks = estimate_blurry_maps(imgs, benchmark_img, \
-      mode='softmax', filter_param=BLURRY_STACK_RADII)
+  all_blurry_stacks = estimate_blurry_maps(imgs, scale, benchmark_img, \
+      mode='softmax', filter_param=radii)
 
   orb = cv2.ORB_create()
   benchmark_features = orb.detectAndCompute(benchmark_img, mask=None)
-  samples = np.array([f.pt for f in benchmark_features[0]], np.uint32)
+  samples = [f.pt for f in benchmark_features[0]]
+  random.shuffle(samples)
+  samples = np.array(samples, np.uint32)
 
-  a, std = estimate_a(wds, BLURRY_STACK_RADII, \
+  a, std_a, wds, std_wds = correct_cam_params(ref_wds, radii, \
       all_blurry_stacks, samples=samples)
-  print('Estimated a = %f with standard variation %f' % (a, std))
+  print('Estimated a = %f with standard variation %.2f' % (a, std_a))
+  print('Corrected wds = %s with standard variation %.2f' % (wds, std_wds))
 
-  depth_map, conf_map = estimate_distances(wds, BLURRY_STACK_RADII, \
-      all_blurry_stacks, a, mask, benchmark_img)
-  # smooth_depth = smooth_depth_map(depth_map, conf_map, 60)
-  viz.normalize_and_draw(depth_map, './doll_data_out/depth_map.jpg', 0)
-
+  radii = np.array(radii / a + 1, np.float32)
+  depth_map, conf_map = estimate_distances(wds, radii, all_blurry_stacks, \
+      mask, benchmark_img, scale)
+  plt.hist(depth_map[mask == 1], bins=300, range=(400, 660))
+  plt.savefig('./doll_data_out/depth_dist.jpg')
+  plt.clf()
+  plt.hist(conf_map[mask == 1], bins=300)
+  plt.savefig('./doll_data_out/conf_dist.jpg')
+  plt.clf()
+  viz.normalize_and_draw(depth_map, './doll_data_out/raw_depth_map.jpg', 0)
+  viz.normalize_and_draw(conf_map, './doll_data_out/conf_map.jpg', 0)
   model.output_ply_file(depth_map, benchmark_img, \
       './doll_data_out/raw_model.ply', \
-      sensor_size=APS_C_SENSOR_SIZE, focal_length=FOCAL_LENGTH)
+      sensor_size=APS_C_SENSOR_SIZE, focal_length=FOCAL_LENGTH, \
+      break_thresh=5)
+  np.save('./doll_data_out/depth_map.npy', depth_map)
+  np.save('./doll_data_out/conf_map.npy', conf_map)
+
+  depth_map = np.load('./doll_data_out/depth_map.npy')
+  conf_map = np.load('./doll_data_out/conf_map.npy')
+  benchmark_img = cv2.imread('./doll_data_out/benchmark_cropped.jpg')
+  mask = image.extract_foreground(benchmark_img, \
+      np.array(FOREGROUND_RECT) * scale)
+  depth_map[mask == 0] = VERY_FAR
+  smooth_depth = smooth_depth_map(depth_map, conf_map, 90, mask)
+  smooth_depth[mask == 0] = VERY_FAR
+  viz.normalize_and_draw(smooth_depth, './doll_data_out/depth_map.jpg', 0)
+  viz.normalize_and_draw(conf_map, './doll_data_out/conf_map.jpg', 0)
+
+  model.output_ply_file(smooth_depth, benchmark_img, \
+      './doll_data_out/model.ply', \
+      sensor_size=APS_C_SENSOR_SIZE, focal_length=FOCAL_LENGTH, \
+      break_thresh=5)
 
 if __name__ == '__main__':
   main_doll()
