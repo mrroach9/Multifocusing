@@ -4,7 +4,7 @@ import matplotlib.cm as cm
 import matplotlib.lines as lines
 import numpy as np
 from scipy import interpolate
-from .utils import normalize
+from .utils import normalize, hist_equalize
 
 def normalize_and_draw(img, outpath, norm_percentile):
   """

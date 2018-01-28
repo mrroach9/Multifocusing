@@ -48,28 +48,18 @@ def read_and_preprocess(filename, resize_factor=1.0, grayscale=True):
   img = cv2.resize(img, (0, 0), fx=resize_factor, fy=resize_factor)
   return img
 
-def read_chem_images(path, resize_factor=1.0):
-  print('Reading and pre-processing images...')
-  img_filenames = os.listdir(path)
-  imgs = [read_and_preprocess(path + filename, resize_factor) \
-      for filename in img_filenames]
-  return imgs
-
-def read_camera_images(blurry_path, benchmark_path, resize_factor=1.0):
+def read_camera_images(blurry_path, resize_factor=1.0):
   print('Reading and pre-processing images...')
 
   img_filenames = os.listdir(blurry_path)
   imgs = [read_and_preprocess(blurry_path + filename, \
       resize_factor, grayscale=False) \
       for filename in img_filenames]
-  benchmark_img = read_and_preprocess(benchmark_path, \
-      resize_factor, grayscale=False) \
-      if benchmark_path is not None else None
 
   wds = image.extract_wd_from_exif(\
       [blurry_path + filename for filename in img_filenames])
   print(wds)
-  return imgs, benchmark_img, wds
+  return imgs, wds
 
 def align_images(imgs, benchmark_img):
   print('Aligning images...')
@@ -197,8 +187,6 @@ def correct_cam_params(ref_wds, radii, blurry_stacks, samples):
 def estimate_distances(wds, radii, blurry_stacks, mask, focused_img, scale):
   print('Estimating distances of foreground pixels...')
   blurry_stacks = np.array(blurry_stacks, np.float32)
-  sum_boxsize = 2 * math.ceil(IMG_SUM_SIZE * scale) + 1
-  sum_img = utils.sum_box_filter(focused_img, sum_boxsize)
 
   H = blurry_stacks.shape[2]
   W = blurry_stacks.shape[3]
@@ -222,7 +210,6 @@ def estimate_distances(wds, radii, blurry_stacks, mask, focused_img, scale):
         print('\tMinimizing integrations for #%d/%d...' % (count, total_pixels))
 
       ssd = blurry_stacks[:, :, y, x]
-      
       spline = interpolate.RectBivariateSpline(wds, radii, ssd, kx=1, ky=1)
       energy_func = lambda d: sum(spline(wd, d / wd)[0, 0] \
           for wd in np.linspace(min_wd, max_wd, INTEGRATION_STEPS))
@@ -238,19 +225,12 @@ def estimate_distances(wds, radii, blurry_stacks, mask, focused_img, scale):
     #   viz.visualize_grid_map(ssd, wds, radii, \
     #       outpath='./doll_data_out/%d_%d_%.2f.png' % (x, y, sol.x))
 
-      conf = misc.derivative(energy_func, sol.x, dx=2.0, n=2, order=5) / sol.fun
-      conf_map[y, x] = np.log(conf / sum_img[y, x] + 1.0)
-
-    #   print('Point (%d, %d): d=%.2f, conf=%.4f, energy=%.2f' % \
-    #       (x, y, depth_map[y, x], conf_map[y, x], sol.fun))
+      conf = misc.derivative(energy_func, sol.x, dx=2.0, n=2, order=5)
+      conf_map[y, x] = conf / sol.fun
 
       if count % 100000 == 0:
-        viz.normalize_and_draw(depth_map, './doll_data_out/raw_depth_map.jpg', 0)
-        viz.normalize_and_draw(conf_map, './doll_data_out/conf_map.jpg', 0)
-        model.output_ply_file(depth_map, focused_img, \
-            './doll_data_out/raw_model.ply', \
-            sensor_size=APS_C_SENSOR_SIZE, focal_length=FOCAL_LENGTH, \
-            break_thresh=5)
+        output_results(depth_map, conf_map, mask, focused_img, \
+            './doll_data_out/', raw=True)
   return depth_map, conf_map
 
 # Smooth the depth map.
@@ -279,50 +259,48 @@ def smooth_depth_map(depth, conf, percentile, fore_mask):
   smooth_depth += shift
   return smooth_depth
 
-def main_chem():
-  imgs = read_chem_images('./chem_data/')
-  imgs, _ = align_images(imgs, np.array(imgs[3]))
-  wds = CHEM_DATA_WD
-  focused_img = image.refocus_image(imgs)
-  cv2.imwrite('./chem_data_out/focused_image.tiff', focused_img)
+def output_results(depth, conf, mask, img, folder, raw=True):
+  depth_map_filename = 'raw_depth_map.jpg' if raw else 'depth_map.jpg'
+  model_filename = 'raw_model.ply' if raw else 'model.ply'
+  conf_map_filename = 'conf_map.jpg'
+  depth_map_np_filename = 'raw_depth_map.npy' if raw else 'depth_map.npy'
+  conf_map_np_filename = 'conf_map.npy'
+  benchmark_img_filename = 'benchmark.jpg'
+  foreground_img_filename = 'foreground.jpg'
 
-  all_blurry_stacks = estimate_blurry_maps(imgs, focused_img, mode='gaussian',
-      filter_param=BLURRY_STACK_RADII)
-  
-  orb = cv2.ORB_create()
-  benchmark_features = orb.detectAndCompute(focused_img, mask=None)
-  samples = np.array([f.pt for f in benchmark_features[0]], np.uint32)
+  cv2.imwrite(folder + benchmark_img_filename, img)
+  if mask is not None:
+    cv2.imwrite(folder + foreground_img_filename, mask * 255)
+  viz.normalize_and_draw(depth, folder + depth_map_filename, 0)
+  np.save(folder + depth_map_np_filename, depth)
 
-  a, std = estimate_a(wds, BLURRY_STACK_RADII, \
-      all_blurry_stacks, samples=samples)
+  if conf is not None and mask is not None:
+    equalized_conf = np.array(conf)
+    equalized_conf[mask == 1] = \
+        utils.hist_equalize(conf[mask == 1], (1e-3, 1.0))
+    equalized_conf[mask == 0] = 0.0
+    viz.normalize_and_draw(equalized_conf, folder + conf_map_filename, 0)
+    np.save(folder + conf_map_np_filename, conf)
 
-  mask = np.ones(focused_img.shape)
-  depth_map, conf_map = estimate_distances(wds, BLURRY_STACK_RADII, \
-      all_blurry_stacks, a, mask, focused_img)
-
-  # smooth_depth = smooth_depth_map(depth_map, conf_map, 60)
-  viz.normalize_and_draw(depth_map, './chem_data_out/depth_map.tiff', 0)
-
-  model.output_ply_file(depth_map, focused_img, \
-      './chem_data_out/model.ply', pixel_size=PIXEL_SIZE)
+  model.output_ply_file(depth, img, folder + model_filename, \
+      sensor_size=APS_C_SENSOR_SIZE, focal_length=FOCAL_LENGTH, \
+      break_thresh=5)
 
 def main_doll():
   scale = 0.2
+  input_folder = './doll_data/f4.0/'
+  output_folder = './doll_data_out/'
   blurry_radius = MAX_BLURRY_RADIUS * scale
   radii = np.linspace(-blurry_radius, blurry_radius, BLURRY_STACK_SIZE)
-  imgs, _, ref_wds = read_camera_images(
-      './doll_data/f4.0/', None, resize_factor=scale)
+  imgs, ref_wds = read_camera_images(input_folder, resize_factor=scale)
 
-  benchmark_img = imgs[5]
+  benchmark_img = imgs[len(imgs) // 2 - 1]
   original_size = benchmark_img.shape
   imgs, benchmark_img = align_images(imgs, benchmark_img)
   benchmark_img = image.refocus_image(imgs)
-  cv2.imwrite('./doll_data_out/benchmark_cropped.jpg', benchmark_img)
 
-  #(95, 116, 900, 620)
   mask = image.extract_foreground(benchmark_img, \
       np.array(FOREGROUND_RECT) * scale)
-  cv2.imwrite('./doll_data_out/foreground.jpg', mask * 255)
 
   all_blurry_stacks = estimate_blurry_maps(imgs, scale, benchmark_img, \
       mode='softmax', filter_param=radii)
@@ -341,36 +319,19 @@ def main_doll():
   radii = np.array(radii / a + 1, np.float32)
   depth_map, conf_map = estimate_distances(wds, radii, all_blurry_stacks, \
       mask, benchmark_img, scale)
-  plt.hist(depth_map[mask == 1], bins=300, range=(400, 660))
-  plt.savefig('./doll_data_out/depth_dist.jpg')
-  plt.clf()
-  plt.hist(conf_map[mask == 1], bins=300)
-  plt.savefig('./doll_data_out/conf_dist.jpg')
-  plt.clf()
-  viz.normalize_and_draw(depth_map, './doll_data_out/raw_depth_map.jpg', 0)
-  viz.normalize_and_draw(conf_map, './doll_data_out/conf_map.jpg', 0)
-  model.output_ply_file(depth_map, benchmark_img, \
-      './doll_data_out/raw_model.ply', \
-      sensor_size=APS_C_SENSOR_SIZE, focal_length=FOCAL_LENGTH, \
-      break_thresh=5)
-  np.save('./doll_data_out/depth_map.npy', depth_map)
-  np.save('./doll_data_out/conf_map.npy', conf_map)
+  output_results(depth_map, conf_map, mask, benchmark_img, \
+      output_folder, raw=True)
 
-  depth_map = np.load('./doll_data_out/depth_map.npy')
-  conf_map = np.load('./doll_data_out/conf_map.npy')
-  benchmark_img = cv2.imread('./doll_data_out/benchmark_cropped.jpg')
+  depth_map = np.load(output_folder + 'raw_depth_map.npy')
+  conf_map = np.load(output_folder + 'conf_map.npy')
+  benchmark_img = cv2.imread(output_folder + 'benchmark.jpg')
   mask = image.extract_foreground(benchmark_img, \
       np.array(FOREGROUND_RECT) * scale)
   depth_map[mask == 0] = VERY_FAR
   smooth_depth = smooth_depth_map(depth_map, conf_map, 90, mask)
   smooth_depth[mask == 0] = VERY_FAR
-  viz.normalize_and_draw(smooth_depth, './doll_data_out/depth_map.jpg', 0)
-  viz.normalize_and_draw(conf_map, './doll_data_out/conf_map.jpg', 0)
-
-  model.output_ply_file(smooth_depth, benchmark_img, \
-      './doll_data_out/model.ply', \
-      sensor_size=APS_C_SENSOR_SIZE, focal_length=FOCAL_LENGTH, \
-      break_thresh=5)
+  output_results(smooth_depth, None, None, benchmark_img, \
+      output_folder, raw=False)
 
 if __name__ == '__main__':
   main_doll()

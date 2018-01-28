@@ -1,6 +1,7 @@
 import cv2
 import math
 import numpy as np
+from scipy import interpolate
 import skimage.morphology as morph
 import skimage.measure as measure
 
@@ -56,14 +57,6 @@ def variance_box_filter(img, boxsize):
   EX_2 = np.square(cv2.boxFilter(img, ddepth=-1, ksize=kernel))
   E_X2 = cv2.boxFilter(img * img, ddepth=-1, ksize=kernel)
   return E_X2 - EX_2
-
-def sum_box_filter(img, boxsize):
-  if img.ndim == 3:
-    img = np.array(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), np.float32)
-  else:
-    img = np.array(img, np.float32)
-  kernel = (boxsize, boxsize)
-  return cv2.boxFilter(img, ddepth=-1, ksize=kernel)
 
 def gen_disk_filters(radii):
   """
@@ -122,3 +115,15 @@ def calc_max_incribed_rect(trans, shape):
   leftedge = math.ceil(np.max(np.array(topleft + bottomleft)[:, 0]))
   rightedge = math.floor(np.min(np.array(topright + bottomright)[:, 0]))
   return np.array([[topedge, bottomedge], [leftedge, rightedge]], np.uint32)
+
+def hist_equalize(data, bound):
+  a = bound[0]
+  r = bound[1] - bound[0]
+  hist, edges = np.histogram(data, bins=1000)
+  cdf = np.cumsum(hist) / np.sum(hist)
+  x_val = (edges[:-1] + edges[1:]) / 2.0
+  cdf_func = interpolate.interp1d(x_val, cdf)
+  equalized_func = np.vectorize(lambda x: a if x < x_val[0] \
+      else a + r if x > x_val[-1] \
+      else a + r * cdf_func(x))
+  return equalized_func(data)
