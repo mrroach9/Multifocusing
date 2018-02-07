@@ -18,23 +18,20 @@ CAMERA_CORRECTION_BUCKET = 5
 # [Depth Map Phase] Stdandard deviations of Gaussian blurring kernels when
 # estimating blurry-ness of pixels in an image.
 MAX_BLURRY_RADIUS = 100.0
-BLURRY_STACK_SIZE = 93
-INTEGRATION_STEPS = 29
-IMG_SUM_SIZE = 25
-# [Depth Map Phase] Window size to calculate difference between blurred
-# refocused image and original image.
-# BLUR_EST_WINDOW_SIZE = 5  # Chem
-BLUR_EST_WINDOW_SIZE = 20 # Camera
+BLURRY_STACK_SIZE = 73
 # VERY_FAR = 3700 # Chem
 VERY_FAR = 700  # Camera
-# [Smoothing Phase] When smoothing the image, we first need to remove 
-# extreme outliers. In percenage. 0.8 means remove the highest 0.8% and the 
-# lowest 0.8%.
-DEPTH_SMOOTH_TRUNC_THRESHOLD = 1.0
 # [Smoothing Phase] Denoising strength.
-DEPTH_SMOOTH_DENOISE_STRENGTH = 10
+DEPTH_SMOOTH_DENOISE_STRENGTH = 20
 # [Smoothing Phase] Inpainting size.
 DEPTH_SMOOTH_INPAINT_SIZE = 30 # 10
+
+SMOOTH_WINDOW_HALFSIZE = 20
+SMOOTH_DECAY = 0.98
+CONF_DECAY = 0.90
+DIST_COEFF = 10.0
+INTEN_COEFF = 255.0 * 0.1
+EXPAND_THRESH = 50.0
 
 CHEM_DATA_WD = [3620, 3630, 3633.726, 3640, 3650, 3660, 3670]
 # PIXEL_SIZE = 0.055  # Chem 
@@ -127,10 +124,8 @@ def estimate_blurry_maps(imgs, scale, benchmark, mode='gaussian', filter_param=[
     blurry_stack = [cv2.filter2D(benchmark, -1, filter) \
         for filter in utils.gen_disk_filters(filter_param)]
 
-  boxsize = 2 * math.ceil(BLUR_EST_WINDOW_SIZE * scale) + 1
   all_ssd_stack = np.array([[ \
-      np.array(cv2.GaussianBlur(np.square(blur - img), \
-          (boxsize, boxsize), 0.0), np.float32) \
+      np.array(np.square(blur - img), np.float32) \
       for blur in blurry_stack] \
       for img in imgs])
   return all_ssd_stack
@@ -195,14 +190,11 @@ def estimate_distances(wds, radii, blurry_stacks, mask, focused_img, scale):
   init = np.mean(wds)
 
   depth_map = VERY_FAR * np.ones([H, W], np.float32)
-  conf_map = np.zeros([H, W], np.float32)
+  conf_map = - np.ones([H, W], np.float32)
   total_pixels = np.count_nonzero(mask)
   count = 0
-#   samples = [[700, 858], [701, 858], [701, 859], [702, 859], [783, 685]]
   for y in range(H):
     for x in range(W):
-#   for p in samples:
-#       y, x = p[1], p[0]
       if mask[y, x] == 0:
         continue
       count += 1
@@ -211,8 +203,7 @@ def estimate_distances(wds, radii, blurry_stacks, mask, focused_img, scale):
 
       ssd = blurry_stacks[:, :, y, x]
       spline = interpolate.RectBivariateSpline(wds, radii, ssd, kx=1, ky=1)
-      energy_func = lambda d: sum(spline(wd, d / wd)[0, 0] \
-          for wd in np.linspace(min_wd, max_wd, INTEGRATION_STEPS))
+      energy_func = lambda d: sum(spline(wd, d / wd)[0, 0] for wd in wds)
       sol = optimize.minimize_scalar(energy_func, \
           bounds=[min_wd, max_wd], method='bounded', tol=1.0)
       depth_map[y, x] = sol.x
@@ -230,7 +221,7 @@ def estimate_distances(wds, radii, blurry_stacks, mask, focused_img, scale):
 
       if count % 100000 == 0:
         output_results(depth_map, conf_map, mask, focused_img, \
-            './doll_data_out/', raw=True)
+            './doll_data_out/', raw=True, output_model=False)
   return depth_map, conf_map
 
 # Smooth the depth map.
@@ -259,7 +250,87 @@ def smooth_depth_map(depth, conf, percentile, fore_mask):
   smooth_depth += shift
   return smooth_depth
 
-def output_results(depth, conf, mask, img, folder, raw=True):
+def get_intensity_weight(img, y, x, win_hsize):
+  intensity_weight = np.array(img[\
+      y - win_hsize : y + win_hsize + 1, \
+      x - win_hsize : x + win_hsize + 1])
+  intensity_weight -= img[y, x]
+  intensity_weight = np.exp(-intensity_weight ** 2 / INTEN_COEFF ** 2)
+  return intensity_weight
+
+def smooth_depth_map_new(depth, conf, mask, img):
+  img = np.array(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), np.float32)
+  adj_conf = np.array(conf)
+  adj_conf[mask == 1] = utils.hist_equalize(conf[mask == 1], (1e-3, 1.0))
+  adj_conf[mask == 1] = np.exp(- 1.0 / adj_conf[mask == 1])
+  adj_conf[mask == 0] = 0.0
+  win_hsize = SMOOTH_WINDOW_HALFSIZE
+  win_size = win_hsize * 2 + 1
+  dist_filter = np.zeros([win_size, win_size], np.float32)
+  for y in range(win_size):
+    for x in range(win_size):
+      dist_filter[y, x] = (y - win_hsize) ** 2 + (x - win_hsize) ** 2
+  dist_filter = np.exp(-dist_filter / DIST_COEFF ** 2)
+  depth = np.array(depth, np.float32)
+  status_mask = np.array(mask, np.uint8)
+  weight_map = np.zeros(depth.shape, np.float32)
+
+  thresh = 1.0
+  decay = SMOOTH_DECAY
+
+  np.set_printoptions(precision=3)
+  while True:
+    thresh *= decay
+    print('Smoothing with thresh=%.3f' % thresh)
+    new_finalized = (adj_conf > math.exp(- 1.0 / thresh)) & (status_mask == 1)
+    num_new_fin = np.count_nonzero(new_finalized)
+    print('\tNewly finalized pixels: %d' % num_new_fin)
+    if num_new_fin == 0:
+      break
+    status_mask[new_finalized] = 2
+    for y in range(depth.shape[0]):
+      for x in range(depth.shape[1]):
+        if not new_finalized[y, x]:
+          continue
+        intensity_weight = get_intensity_weight(img, y, x, win_hsize)
+        weight_patch = intensity_weight * dist_filter
+        weight_map[y - win_hsize : y + win_hsize + 1, \
+                   x - win_hsize : x + win_hsize + 1] += weight_patch
+    new_expandable = (weight_map > EXPAND_THRESH) & (status_mask == 1)
+    print('\tNewly expandable pixels: %d' % np.count_nonzero(new_expandable))
+
+    for y in range(depth.shape[0]):
+      for x in range(depth.shape[1]):
+        if not new_expandable[y, x]:
+          continue
+        ready_patch = status_mask[\
+            y - win_hsize : y + win_hsize + 1, \
+            x - win_hsize : x + win_hsize + 1] == 2
+        get_intensity_weight(img, y, x, win_hsize)
+        conf_patch = adj_conf[\
+            y - win_hsize : y + win_hsize + 1, \
+            x - win_hsize : x + win_hsize + 1]
+        depth_patch = depth[\
+            y - win_hsize : y + win_hsize + 1, \
+            x - win_hsize : x + win_hsize + 1]
+        weight_patch = ready_patch * dist_filter * intensity_weight
+        d = np.sum(weight_patch * conf_patch * depth_patch) / \
+            np.sum(weight_patch * conf_patch)
+        c = np.sum(weight_patch * conf_patch) / \
+            np.sum(weight_patch)
+        depth[y, x] = d
+        adj_conf[y, x] = c * CONF_DECAY
+
+  viz.normalize_and_draw(depth, './doll_data_out/unsmoothened_depth.jpg', 0)
+  norm_depth, scale, shift = utils.normalize(depth, 0, 255.0)
+  smooth_depth = np.array(norm_depth, np.uint8)  
+  smooth_depth = cv2.fastNlMeansDenoising(smooth_depth, \
+      h=DEPTH_SMOOTH_DENOISE_STRENGTH)
+  smooth_depth = np.array(smooth_depth, np.float32)
+  smooth_depth = (smooth_depth * scale) + shift
+  return smooth_depth
+
+def output_results(depth, conf, mask, img, folder, raw=True, output_model=True):
   depth_map_filename = 'raw_depth_map.jpg' if raw else 'depth_map.jpg'
   model_filename = 'raw_model.ply' if raw else 'model.ply'
   conf_map_filename = 'conf_map.jpg'
@@ -282,12 +353,13 @@ def output_results(depth, conf, mask, img, folder, raw=True):
     viz.normalize_and_draw(equalized_conf, folder + conf_map_filename, 0)
     np.save(folder + conf_map_np_filename, conf)
 
-  model.output_ply_file(depth, img, folder + model_filename, \
-      sensor_size=APS_C_SENSOR_SIZE, focal_length=FOCAL_LENGTH, \
-      break_thresh=5)
+  if output_model:
+    model.output_ply_file(depth, img, folder + model_filename, \
+        sensor_size=APS_C_SENSOR_SIZE, focal_length=FOCAL_LENGTH, \
+        break_thresh=5)
 
 def main_doll():
-  scale = 0.2
+  scale = 0.3
   input_folder = './doll_data/f4.0/'
   output_folder = './doll_data_out/'
   blurry_radius = MAX_BLURRY_RADIUS * scale
@@ -320,7 +392,7 @@ def main_doll():
   depth_map, conf_map = estimate_distances(wds, radii, all_blurry_stacks, \
       mask, benchmark_img, scale)
   output_results(depth_map, conf_map, mask, benchmark_img, \
-      output_folder, raw=True)
+      output_folder, raw=True, output_model=True)
 
   depth_map = np.load(output_folder + 'raw_depth_map.npy')
   conf_map = np.load(output_folder + 'conf_map.npy')
@@ -328,10 +400,10 @@ def main_doll():
   mask = image.extract_foreground(benchmark_img, \
       np.array(FOREGROUND_RECT) * scale)
   depth_map[mask == 0] = VERY_FAR
-  smooth_depth = smooth_depth_map(depth_map, conf_map, 90, mask)
+  smooth_depth = smooth_depth_map_new(depth_map, conf_map, mask, benchmark_img)
   smooth_depth[mask == 0] = VERY_FAR
   output_results(smooth_depth, None, None, benchmark_img, \
-      output_folder, raw=False)
+      output_folder, raw=False, output_model=True)
 
 if __name__ == '__main__':
   main_doll()
